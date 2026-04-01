@@ -307,6 +307,34 @@ def _observation_to_prompt(obs: dict, belief: BeliefState, step_num: int) -> str
     if belief_str != "No hypothesis yet.":
         lines.append(f"\n[BELIEF STATE] {belief_str}")
 
+    # Extract and prominently display agent_context
+    agent_ctx = obs.get("agent_context", {})
+    if agent_ctx:
+        lines.append("\n[YOUR INVESTIGATION STATE]")
+        
+        bugs_found = agent_ctx.get("bugs_found", [])
+        if bugs_found:
+            lines.append(f"Bugs discovered so far: {bugs_found}")
+        else:
+            lines.append("Bugs discovered so far: NONE — you must INSPECT first")
+        
+        bugs_fixed = agent_ctx.get("bugs_fixed", [])
+        if bugs_fixed:
+            lines.append(f"Bugs fixed so far: {bugs_fixed}")
+        
+        tools = agent_ctx.get("tools_available", [])
+        if tools:
+            lines.append(f"Available tools: {tools}")
+        
+        stages = agent_ctx.get("stages_inspected", [])
+        if stages:
+            lines.append(f"Pipeline stages inspected: {stages}")
+        
+        recommended = agent_ctx.get("recommended_next", "")
+        if recommended:
+            lines.append(f"\n*** RECOMMENDED NEXT ACTION: {recommended} ***")
+            lines.append("Following this recommendation will maximize your score.")
+
     lines.append("\nWhat is your next action?")
     return "\n".join(lines)
 
@@ -564,6 +592,21 @@ def main() -> None:
     print(f"  Task 3: {scores.get(3, 0):.4f}")
     print(f"  Average: {avg:.4f}")
     print(f"{'=' * 65}")
+
+    try:
+        http.post(
+            f"{config['api_base_url']}/record_score",
+            json={
+                "task_1": scores.get(1, 0.0),
+                "task_2": scores.get(2, 0.0),
+                "task_3": scores.get(3, 0.0),
+                "average": avg,
+                "model": config["model_name"],
+            },
+            timeout=10,
+        )
+    except Exception:
+        pass  # never crash on leaderboard update
 
 
 if __name__ == "__main__":

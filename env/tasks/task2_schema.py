@@ -50,10 +50,12 @@ class Task2SchemaEnv:
         self.discovered_bugs: set[str] = set()          # NEW: progressive discovery
         self.downstream_health: float = 1.0
         self.blast_events: int = 0
+        self.inspected_targets = set()
         self.visible_signals: VisibleSignals | None = None
         self.signals_unlocked: set[str] = set()
         self.aer_history: list[AERRecord] = []
         self.current_scenario_path: Path | None = None
+        self.inspected_targets: set[str] = set()
 
     def reset(self) -> DataObservation:
         """Reset state and initialize a fresh corrupted Task2 dataframe."""
@@ -73,6 +75,7 @@ class Task2SchemaEnv:
         self.discovered_bugs = set()                     # NEW: starts empty
         self.downstream_health = 1.0
         self.blast_events: int = 0
+        self.inspected_targets = set()
 
         failure_sig = get_failure_signature(self.ground_truth)
         initial_alert = AlertSignal(
@@ -124,72 +127,58 @@ class Task2SchemaEnv:
         done = False
 
         scenario_bugs = load_scenario(str(self.current_scenario_path))
-        expected_renames = {
-            b["new_col"]: b["old_col"]
-            for b in scenario_bugs
-            if b.get("type") == "schema_drift"
-        }
+        expected_renames = {b["new_col"]: b["old_col"] for b in scenario_bugs if b.get("type") == "schema_drift"}
 
         if action.action_type == ActionType.INSPECT:
             target = (action.target_column or "").lower()
-
-            # --- Tool target aliases (callable tool names → facet targets) ---
             _TOOL_ALIASES = {
-                "run_null_check": "metrics",
-                "run_type_check": "schema",
-                "run_duplicate_check": "metrics",
-                "run_pii_scan": "pii",
-                "run_schema_diff": "schema",
-                "trace_pipeline_stage": "dag",
+                "run_null_check": "metrics", "run_type_check": "schema",
+                "run_duplicate_check": "metrics", "run_pii_scan": "pii",
+                "run_schema_diff": "schema", "trace_pipeline_stage": "dag",
             }
             target = _TOOL_ALIASES.get(target, target)
 
-            # --- Facet-level inspection ---
+            reinspecting = target in self.inspected_targets
+            if reinspecting: reward -= 0.05
+            else: self.inspected_targets.add(target)
+
             if target == "metrics" and "metrics" not in self.signals_unlocked:
                 self.visible_signals.metrics = build_metrics_facet(self.df)
                 self.signals_unlocked.add("metrics")
-                reward += 0.05
+                if not reinspecting: reward += 0.05
             elif target == "logs" and "logs" not in self.signals_unlocked:
-                self.visible_signals.logs = build_logs_facet(
-                    ["SchemaError: column employee_id not found", "Warning: consent_flag all NULL"]
-                )
+                self.visible_signals.logs = build_logs_facet(["SchemaError: column employee_id not found", "Warning: consent_flag all NULL"])
                 self.signals_unlocked.add("logs")
-                reward += 0.05
+                if not reinspecting: reward += 0.05
             elif target in ["pii", "ssn", "compliance"] and "compliance" not in self.signals_unlocked:
                 pii_cols = [col for col in self.df.columns if "ssn" in col.lower()]
-                self.visible_signals.compliance = ComplianceFacet(
-                    pii_detected=len(pii_cols) > 0,
-                    risky_columns=pii_cols,
-                )
+                self.visible_signals.compliance = ComplianceFacet(pii_detected=len(pii_cols) > 0, risky_columns=pii_cols)
                 self.signals_unlocked.add("compliance")
-                reward += 0.05
+                if not reinspecting: reward += 0.05
             elif target == "schema" and "schema" not in self.signals_unlocked:
-                # Reveal ALL schema_drift bugs at once
+                new_discoveries = 0
                 for bug in self.ground_truth:
                     if bug["type"] == "schema_drift" and bug["bug_id"] not in self.discovered_bugs:
                         self.discovered_bugs.add(bug["bug_id"])
                         self.identified_bug_ids.add(bug["bug_id"])
-                        reward += 0.10
+                        new_discoveries += 1
                 self.signals_unlocked.add("schema")
-                reward += 0.05
+                if not reinspecting:
+                    reward += 0.05
+                    if new_discoveries > 0: reward += 0.15
             else:
-                # --- Column-specific inspection ---
                 found_any = False
                 for bug in self.ground_truth:
                     bug_col = (bug.get("column") or "").lower()
-                    # Also match new_col / old_col for schema_drift bugs
-                    drift_cols = [
-                        (bug.get("new_col") or "").lower(),
-                        (bug.get("old_col") or "").lower(),
-                    ]
+                    drift_cols = [(bug.get("new_col") or "").lower(), (bug.get("old_col") or "").lower()]
                     match_cols = ([bug_col] if bug_col else []) + drift_cols
                     if target in match_cols and bug["bug_id"] not in self.discovered_bugs:
                         self.discovered_bugs.add(bug["bug_id"])
                         self.identified_bug_ids.add(bug["bug_id"])
-                        reward += 0.15
                         found_any = True
-                if not found_any:
-                    reward -= 0.03
+                if not reinspecting:
+                    if found_any: reward += 0.15
+                    else: reward -= 0.05
 
         elif action.action_type == ActionType.DROP_COLUMN:
             dependents = self.COLUMN_DEPENDENCIES.get(action.target_column, [])
@@ -205,45 +194,59 @@ class Task2SchemaEnv:
             if action.target_column in expected_renames and action.transformation == expected_renames[action.target_column]:
                 src = action.target_column
                 dst = action.transformation
-                if src in self.df.columns and dst not in self.df.columns:
-                    self.df.rename(columns={src: dst}, inplace=True)
-                for bug in self.ground_truth:
-                    if bug["type"] == "schema_drift" and bug.get("column") == dst:
-                        self.fixed_bug_ids.add(bug["bug_id"])
-                reward += 0.20
+                matching_bug = next((b for b in self.ground_truth if b["type"] == "schema_drift" and b.get("old_col") == dst and b.get("new_col") == src), None)
+                if matching_bug:
+                    if matching_bug["bug_id"] not in self.discovered_bugs:
+                        reward -= 0.10
+                    else:
+                        if src in self.df.columns and dst not in self.df.columns:
+                            self.df.rename(columns={src: dst}, inplace=True)
+                        self.fixed_bug_ids.add(matching_bug["bug_id"])
+                        reward += 0.20
+                else:
+                    reward -= 0.05
             else:
-                reward -= 0.10
+                reward -= 0.05
 
         elif action.action_type == ActionType.CAST_TYPE:
             if action.target_column in {"hire_date", "dob_date"} and action.transformation == "cast_to_date":
-                col = "hire_date" if "hire_date" in self.df.columns else "dob_date"
-                if col in self.df.columns:
-                    self.df[col] = pd.to_datetime(self.df[col], errors="coerce").dt.strftime("%Y-%m-%d")
-                    self.fixed_bug_ids.add("B002")
-                    reward += 0.20
-                else:
-                    reward -= 0.10
-            else:
-                reward -= 0.10
+                matching_bug = next((b for b in self.ground_truth if b["type"] == "type_corruption" and b.get("column") == "hire_date"), None)
+                if matching_bug:
+                    if matching_bug["bug_id"] not in self.discovered_bugs:
+                        reward -= 0.10
+                    else:
+                        col = "hire_date" if "hire_date" in self.df.columns else "dob_date"
+                        if col in self.df.columns:
+                            self.df[col] = pd.to_datetime(self.df[col], errors="coerce").dt.strftime("%Y-%m-%d")
+                            self.fixed_bug_ids.add(matching_bug["bug_id"])
+                            reward += 0.20
+                else: reward -= 0.05
+            else: reward -= 0.05
 
         elif action.action_type == ActionType.FILL_DEFAULT:
             if action.target_column == "consent_flag" and "consent_flag" in self.df.columns:
-                self.df["consent_flag"] = self.df["consent_flag"].fillna(False)
-                self.fixed_bug_ids.add("B003")
-                reward += 0.20
-            else:
-                reward -= 0.10
+                matching_bug = next((b for b in self.ground_truth if b["type"] == "null_injection" and b.get("column") == "consent_flag"), None)
+                if matching_bug:
+                    if matching_bug["bug_id"] not in self.discovered_bugs:
+                        reward -= 0.10
+                    else:
+                        self.df["consent_flag"] = self.df["consent_flag"].fillna(False)
+                        self.fixed_bug_ids.add(matching_bug["bug_id"])
+                        reward += 0.20
+                else: reward -= 0.05
+            else: reward -= 0.05
 
         elif action.action_type == ActionType.VALIDATE:
             rows_passing = self._rows_passing()
-            reward += 0.25 * (rows_passing / max(len(self.df), 1))
             if len(self.fixed_bug_ids) == self.TOTAL_BUGS:
+                reward += 0.25
+                reward += 0.30
                 done = True
-                reward += 0.05
+            else:
+                reward -= 0.05
 
         elif action.action_type == ActionType.NOOP:
             reward = 0.0
-
         else:
             reward -= 0.10
 
@@ -253,25 +256,17 @@ class Task2SchemaEnv:
         done = done or (self.step_count >= self.MAX_STEPS)
 
         aer = AERRecord(
-            step_id=self.step_count,
-            action_type=action.action_type.value,
-            target=action.target_column,
-            justification=action.justification,
-            reward_earned=round(reward, 4),
-            issues_identified=list(self.identified_bug_ids),
-            issues_fixed=list(self.fixed_bug_ids),
+            step_id=self.step_count, action_type=action.action_type.value, target=action.target_column,
+            justification=action.justification, reward_earned=round(reward, 4),
+            issues_identified=list(self.identified_bug_ids), issues_fixed=list(self.fixed_bug_ids),
         )
         self.aer_history.append(aer)
 
         return StepResult(
-            observation=self._build_observation(),
-            reward=round(reward, 4),
-            done=done,
+            observation=self._build_observation(), reward=round(reward, 4), done=done,
             info={
-                "blast_events": self.blast_events,
-                "fixed": list(self.fixed_bug_ids),
-                "identified": list(self.identified_bug_ids),
-                "signals_unlocked": list(self.signals_unlocked),
+                "blast_events": self.blast_events, "fixed": list(self.fixed_bug_ids),
+                "identified": list(self.identified_bug_ids), "signals_unlocked": list(self.signals_unlocked),
                 "visible_signals": self.visible_signals.model_dump() if self.visible_signals else {},
                 "aer_last": aer.model_dump(),
             },

@@ -48,6 +48,7 @@ class Task1AuditEnv:
         self.signals_unlocked: set[str] = set()
         self.aer_history: list[AERRecord] = []
         self.step_errors: list[str] = []
+        self.inspected_targets: set[str] = set()
 
     def reset(self) -> DataObservation:
         """Reset state, generate deterministic data, inject bugs, and return observation."""
@@ -72,6 +73,7 @@ class Task1AuditEnv:
         self.signals_unlocked = set()
         self.aer_history = []
         self.step_errors = []
+        self.inspected_targets = set()
 
         return self._build_observation()
 
@@ -83,7 +85,6 @@ class Task1AuditEnv:
         if action.action_type == ActionType.INSPECT:
             target = (action.target_column or "").lower()
 
-            # --- Tool target aliases (callable tool names → facet targets) ---
             _TOOL_ALIASES = {
                 "run_null_check": "metrics",
                 "run_type_check": "schema",
@@ -94,129 +95,120 @@ class Task1AuditEnv:
             }
             target = _TOOL_ALIASES.get(target, target)
 
-            # --- Facet-level inspection (unlock observability signals) ---
+            reinspecting = target in self.inspected_targets
+            if reinspecting:
+                reward -= 0.05
+            else:
+                self.inspected_targets.add(target)
+
             if target == "metrics" and "metrics" not in self.signals_unlocked:
                 self.visible_signals.metrics = build_metrics_facet(self.df)
                 self.signals_unlocked.add("metrics")
-                reward += 0.05
+                if not reinspecting: reward += 0.05
             elif target == "logs" and "logs" not in self.signals_unlocked:
                 self.visible_signals.logs = build_logs_facet(self.step_errors or ["No errors logged"])
                 self.signals_unlocked.add("logs")
-                reward += 0.05
+                if not reinspecting: reward += 0.05
             elif target == "dag" and "dag" not in self.signals_unlocked:
-                self.visible_signals.dag = DagOverview(
-                    current_node="stage_1_audit",
-                    upstream_nodes=["ingestion"],
-                    downstream_nodes=["reporting"],
-                )
+                self.visible_signals.dag = DagOverview(current_node="stage_1_audit", upstream_nodes=["ingestion"], downstream_nodes=["reporting"])
                 self.signals_unlocked.add("dag")
-                reward += 0.03
+                if not reinspecting: reward += 0.05
             elif target in ["pii", "ssn", "compliance"] and "compliance" not in self.signals_unlocked:
                 pii_cols = [col for col in self.df.columns if "ssn" in col.lower()]
-                self.visible_signals.compliance = ComplianceFacet(
-                    pii_detected=len(pii_cols) > 0,
-                    risky_columns=pii_cols,
-                )
+                self.visible_signals.compliance = ComplianceFacet(pii_detected=len(pii_cols) > 0, risky_columns=pii_cols)
                 self.signals_unlocked.add("compliance")
-                reward += 0.05
+                if not reinspecting: reward += 0.05
             elif target == "schema" and "schema" not in self.signals_unlocked:
-                # Reveal schema-drift bugs
                 for bug in self.ground_truth:
                     if bug["type"] == "schema_drift" and bug["bug_id"] not in self.discovered_bugs:
                         self.discovered_bugs.add(bug["bug_id"])
-                        reward += 0.10
+                        if not reinspecting: reward += 0.15
                 self.signals_unlocked.add("schema")
-                reward += 0.05
+                if not reinspecting: reward += 0.05
             else:
-                # --- Column-specific inspection (progressive bug discovery) ---
                 found_any = False
                 for bug in self.ground_truth:
                     bug_col = (bug.get("column") or "").lower()
                     if bug_col and bug_col == target and bug["bug_id"] not in self.discovered_bugs:
                         self.discovered_bugs.add(bug["bug_id"])
                         self.identified_bug_ids.add(bug["bug_id"])
-                        reward += 0.15
                         found_any = True
-                if not found_any:
-                    reward -= 0.03  # wasted inspection step
-
-            # Legacy: also credit inline identified_issues from agent
-            for issue in (action.identified_issues or []):
-                for truth in self.ground_truth:
-                    if matches_ground_truth(issue, truth) and truth["bug_id"] not in self.identified_bug_ids:
+                if not reinspecting:
+                    if found_any:
                         reward += 0.15
-                        self.identified_bug_ids.add(truth["bug_id"])
-                        break
+                    else:
+                        reward -= 0.05
+
+        elif action.action_type == ActionType.FILL_DEFAULT:
+            col = action.target_column
+            matching_bug = next((b for b in self.ground_truth if b["type"] == "null_injection" and b.get("column") == col and b["bug_id"] not in self.fixed_bug_ids), None)
+            if matching_bug:
+                if matching_bug["bug_id"] not in self.discovered_bugs:
+                    reward -= 0.10
+                elif action.transformation == "fill_median":
+                    median_val = pd.to_numeric(self.df[col], errors="coerce").median()
+                    self.df[col] = pd.to_numeric(self.df[col], errors="coerce").fillna(median_val)
+                    reward += 0.20
+                    self.fixed_bug_ids.add(matching_bug["bug_id"])
+                elif action.transformation == "fill_zero":
+                    self.df[col] = pd.to_numeric(self.df[col], errors="coerce").fillna(0)
+                    reward += 0.20
+                    self.fixed_bug_ids.add(matching_bug["bug_id"])
                 else:
                     reward -= 0.05
-
-        elif (
-            action.action_type == ActionType.FILL_DEFAULT
-            and action.target_column == "salary"
-            and action.transformation == "fill_median"
-        ):
-            if "B001" not in self.fixed_bug_ids:
-                median_val = self.df["salary"].median()
-                self.df["salary"] = self.df["salary"].fillna(median_val)
-                reward += 0.20
-                self.fixed_bug_ids.add("B001")
             else:
                 reward -= 0.05
 
-        elif (
-            action.action_type == ActionType.CAST_TYPE
-            and action.target_column == "age"
-            and action.transformation == "cast_to_int"
-        ):
-            action_fixed_any = False
-            if "B002" not in self.fixed_bug_ids:
-                self.df.loc[5, "age"] = 23
-                self.fixed_bug_ids.add("B002")
-                reward += 0.20
-                action_fixed_any = True
-
-            numeric_age = pd.to_numeric(self.df["age"], errors="coerce")
-            invalid_mask = (numeric_age > 150) | (numeric_age < 0)
-            if invalid_mask.any() and "B003" not in self.fixed_bug_ids:
-                median_age = int(numeric_age[(numeric_age >= 0) & (numeric_age <= 150)].median())
-                self.df.loc[invalid_mask, "age"] = median_age
-                self.fixed_bug_ids.add("B003")
-                reward += 0.20
-                action_fixed_any = True
-
-            if not action_fixed_any:
+        elif action.action_type == ActionType.CAST_TYPE:
+            col = action.target_column
+            matching_bugs = [b for b in self.ground_truth if b["type"] in ["type_corruption", "out_of_range"] and b.get("column") == col and b["bug_id"] not in self.fixed_bug_ids]
+            if matching_bugs:
+                if not all(b["bug_id"] in self.discovered_bugs for b in matching_bugs):
+                    reward -= 0.10
+                elif action.transformation in ["cast_to_int", "cast_to_float"]:
+                    self.df[col] = pd.to_numeric(self.df[col], errors="coerce")
+                    if action.transformation == "cast_to_int":
+                        median_val = int(self.df[col].median())
+                        self.df[col] = self.df[col].fillna(median_val).astype(object)
+                    for b in matching_bugs:
+                        self.fixed_bug_ids.add(b["bug_id"])
+                        reward += 0.20
+                else:
+                    reward -= 0.05
+            else:
                 reward -= 0.05
 
         elif action.action_type == ActionType.VALIDATE:
-            action_fixed_any = False
-            if "B004" not in self.fixed_bug_ids:
-                current = str(self.df.loc[10, "phone"])
-                digits = "".join(ch for ch in current if ch.isdigit())
-                if len(digits) >= 10:
-                    self.df.loc[10, "phone"] = digits[-10:]
-                self.fixed_bug_ids.add("B004")
-                action_fixed_any = True
-
-            if "B005" not in self.fixed_bug_ids:
-                self.df = self.df.drop_duplicates().reset_index(drop=True)
-                self.fixed_bug_ids.add("B005")
-                action_fixed_any = True
-
-            if not action_fixed_any:
-                reward -= 0.05
-
-            fixed_ratio = len(self.fixed_bug_ids) / self.TOTAL_BUGS
+            fixed_this_step = False
+            for bug in self.ground_truth:
+                if bug["bug_id"] in self.fixed_bug_ids or bug["bug_id"] not in self.discovered_bugs: continue
+                if bug["type"] == "format_inconsistency":
+                    col = bug.get("column", "phone")
+                    if col in self.df.columns:
+                        self.df[col] = self.df[col].astype(str).str.replace(r"[^\d]", "", regex=True).str[-10:]
+                    self.fixed_bug_ids.add(bug["bug_id"])
+                    fixed_this_step = True
+                elif bug["type"] == "duplicate_rows":
+                    self.df = self.df.drop_duplicates().reset_index(drop=True)
+                    self.fixed_bug_ids.add(bug["bug_id"])
+                    fixed_this_step = True
+            if fixed_this_step:
+                reward += 0.20
             if len(self.fixed_bug_ids) == self.TOTAL_BUGS:
+                reward += 0.25
                 reward += 0.30
                 done = True
-            else:
-                reward += 0.10 * fixed_ratio
+            elif not fixed_this_step:
+                reward -= 0.05
 
         elif action.action_type == ActionType.DROP_COLUMN:
             reward -= 0.10
 
         elif action.action_type == ActionType.NOOP:
             reward = 0.0
+
+        else:
+            reward -= 0.10
 
         reward = max(-0.5, min(1.0, reward))
         self.step_count += 1

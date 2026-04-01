@@ -98,7 +98,8 @@ class Task3IncidentEnv:
         self.visible_signals: VisibleSignals | None = None
         self.signals_unlocked: set[str] = set()
         self.discovered_bugs: set[str] = set()          # NEW: progressive discovery
-        self.stages_inspected: set[str] = set()         # NEW: track stage investigation
+        self.stages_inspected: set[str] = set()
+        self.inspected_targets: set[str] = set()         # NEW: track stage investigation
         self.aer_history: list[AERRecord] = []
 
     def reset(self) -> DataObservation:
@@ -153,88 +154,56 @@ class Task3IncidentEnv:
 
         if action.action_type == ActionType.INSPECT:
             target = (action.target_column or "").lower()
-
-            # --- Tool target aliases (callable tool names → facet targets) ---
             _TOOL_ALIASES = {
-                "run_null_check": "metrics",
-                "run_type_check": "schema",
-                "run_duplicate_check": "metrics",
-                "run_pii_scan": "pii",
+                "run_null_check": "metrics", "run_type_check": "schema",
+                "run_duplicate_check": "metrics", "run_pii_scan": "pii",
                 "run_schema_diff": "schema",
             }
-            # Only apply alias if target is not a stage reference
-            if target in _TOOL_ALIASES:
-                target = _TOOL_ALIASES[target]
+            if target in _TOOL_ALIASES: target = _TOOL_ALIASES[target]
 
-            # --- Stage-by-stage investigation (multi-stage tracing) ---
+            reinspecting = target in self.inspected_targets
+            if reinspecting: reward -= 0.05
+            else: self.inspected_targets.add(target)
+
             stage_key = None
             for sk in self.STAGE_CLUES:
-                # Match "stage_5", "stage_5_output", "stage5", etc.
-                if target.replace("_", "").replace(" ", "").startswith(
-                    sk.replace("_", "")
-                ):
+                if target.replace("_", "").replace(" ", "").startswith(sk.replace("_", "")):
                     stage_key = sk
                     break
 
             if stage_key and stage_key not in self.stages_inspected:
                 clue = self.STAGE_CLUES[stage_key]
                 self.stages_inspected.add(stage_key)
-                reward += clue["reward"]
-                # Discover bugs associated with this stage
+                if not reinspecting: reward += clue["reward"]
+                new_discoveries = 0
                 for bug_id in clue["bugs"]:
                     if bug_id not in self.discovered_bugs:
                         self.discovered_bugs.add(bug_id)
-                # If agent reached stage_3, mark diagnosis correct
+                        new_discoveries += 1
+                if new_discoveries > 0 and not reinspecting: reward += 0.15
                 if stage_key == "stage_3":
                     self.diagnosis_correct = True
                     self.pipeline_stage_health["stage_3_join"] = 0.5
-
-            # --- Facet-level inspection ---
             elif target in ["metrics", "row_count", "revenue"] and "metrics" not in self.signals_unlocked:
                 metrics = build_metrics_facet(self.df)
                 if self.zombie_partition_active:
-                    metrics = MetricsFacet(
-                        row_count=metrics.row_count,
-                        historical_avg=metrics.historical_avg,
-                        null_ratio=metrics.null_ratio,
-                        storage_bytes=0,
-                    )
+                    metrics = MetricsFacet(row_count=metrics.row_count, historical_avg=metrics.historical_avg, null_ratio=metrics.null_ratio, storage_bytes=0)
                 self.visible_signals.metrics = metrics
                 self.signals_unlocked.add("metrics")
-                reward += 0.05
-
+                if not reinspecting: reward += 0.05
             elif target in ["logs", "join"] and "logs" not in self.signals_unlocked:
-                self.visible_signals.logs = build_logs_facet(
-                    [
-                        "JoinError: column rev_amt not found in right table",
-                        "TypeError: cannot convert str to float64",
-                        "Warning: SSN column propagated to output",
-                    ],
-                    status="failed",
-                )
+                self.visible_signals.logs = build_logs_facet(["JoinError: column rev_amt not found in right table", "TypeError: cannot convert str to float64", "Warning: SSN column propagated to output"], status="failed")
                 self.signals_unlocked.add("logs")
-                reward += 0.05
-
+                if not reinspecting: reward += 0.05
             elif target in ["pii", "ssn", "compliance"] and "compliance" not in self.signals_unlocked:
-                self.visible_signals.compliance = ComplianceFacet(
-                    pii_detected=not self.pii_masked,
-                    risky_columns=["ssn"] if not self.pii_masked else [],
-                )
+                self.visible_signals.compliance = ComplianceFacet(pii_detected=not self.pii_masked, risky_columns=["ssn"] if not self.pii_masked else [])
                 self.signals_unlocked.add("compliance")
-                reward += 0.03
-
+                if not reinspecting: reward += 0.05
             elif target == "dag" and "dag" not in self.signals_unlocked:
-                from env.models import DagOverview
-                self.visible_signals.dag = DagOverview(
-                    current_node="stage_5_output",
-                    upstream_nodes=["stage_4_aggregate", "stage_3_join", "stage_2_clean", "stage_1_ingest"],
-                    downstream_nodes=[],
-                )
+                self.visible_signals.dag = DagOverview(current_node="stage_5_output", upstream_nodes=["stage_4_aggregate", "stage_3_join", "stage_2_clean", "stage_1_ingest"], downstream_nodes=[])
                 self.signals_unlocked.add("dag")
-                reward += 0.03
-
+                if not reinspecting: reward += 0.05
             else:
-                # Column-specific / keyword-based diagnosis (legacy support)
                 justification_lower = action.justification.lower()
                 keyword_hits = sum(1 for kw in self.CORRECT_DIAGNOSIS_KEYWORDS if kw in justification_lower)
                 target_relevant = target in ["rev_amt", "revenue_amount", "ssn", ""]
@@ -242,77 +211,78 @@ class Task3IncidentEnv:
                 if keyword_hits >= 2 and target_relevant:
                     self.diagnosis_correct = True
                     self.pipeline_stage_health["stage_3_join"] = 0.5
-                    reward += 0.25
+                    if not reinspecting: reward += 0.20
                 elif keyword_hits >= 1:
-                    reward += min(0.05 * keyword_hits, 0.15)
+                    if not reinspecting: reward += min(0.05 * keyword_hits, 0.15)
                 else:
-                    # Column-specific bug discovery
                     found_any = False
                     for bug in self.ground_truth:
                         bug_col = (bug.get("column") or "").lower()
                         if bug_col and bug_col == target and bug["bug_id"] not in self.discovered_bugs:
                             self.discovered_bugs.add(bug["bug_id"])
-                            reward += 0.15
                             found_any = True
-                    if not found_any:
-                        reward -= 0.03
+                    if not reinspecting:
+                        if found_any: reward += 0.15
+                        else: reward -= 0.05
 
         elif action.action_type == ActionType.RENAME_COLUMN:
             if action.target_column == "rev_amt":
-                if "rev_amt" in self.df.columns and "revenue_amount" not in self.df.columns:
-                    self.df.rename(columns={"rev_amt": "revenue_amount"}, inplace=True)
-                reward += 0.15
-                if self.diagnosis_correct:
-                    reward += 0.05
-            else:
-                reward -= 0.10
+                matching_bug = next((b for b in self.ground_truth if b["type"] == "schema_drift" and b.get("old_col") == "revenue_amount"), None)
+                if matching_bug:
+                    if matching_bug["bug_id"] not in self.discovered_bugs:
+                        reward -= 0.10
+                    else:
+                        if "rev_amt" in self.df.columns and "revenue_amount" not in self.df.columns:
+                            self.df.rename(columns={"rev_amt": "revenue_amount"}, inplace=True)
+                        reward += 0.20
+                else: reward -= 0.05
+            else: reward -= 0.05
 
         elif action.action_type == ActionType.CAST_TYPE:
             if action.target_column in ["rev_amt", "revenue_amount"] and action.transformation == "cast_to_float":
-                col = "revenue_amount" if "revenue_amount" in self.df.columns else "rev_amt"
-                if col in self.df.columns:
-                    self.df[col] = pd.to_numeric(self.df[col], errors="coerce").astype(float)
-                    self.fix_applied = True
-                    reward += 0.20
-                    self.pipeline_stage_health["stage_3_join"] = 1.0
-                    self.pipeline_stage_health["stage_4_aggregate"] = 0.8
-                else:
-                    reward -= 0.10
-            else:
-                reward -= 0.10
+                matching_bug = next((b for b in self.ground_truth if b["type"] == "type_corruption" and b.get("column") == "revenue_amount"), None)
+                if matching_bug:
+                    if matching_bug["bug_id"] not in self.discovered_bugs:
+                        reward -= 0.10
+                    else:
+                        col = "revenue_amount" if "revenue_amount" in self.df.columns else "rev_amt"
+                        if col in self.df.columns:
+                            self.df[col] = pd.to_numeric(self.df[col], errors="coerce").astype(float)
+                            self.fix_applied = True
+                            self.pipeline_stage_health["stage_3_join"] = 1.0
+                            self.pipeline_stage_health["stage_4_aggregate"] = 0.8
+                            reward += 0.20
+                else: reward -= 0.05
+            else: reward -= 0.05
 
         elif action.action_type == ActionType.MASK_PII:
             if action.target_column == "ssn" and "ssn" in self.df.columns:
-                self.df["ssn"] = self.df["ssn"].astype(str).str.replace(r"\d", "X", regex=True)
-                self.pii_masked = True
-                reward += 0.20
-            else:
-                reward -= 0.10
+                matching_bug = next((b for b in self.ground_truth if b["type"] == "pii_leak"), None)
+                if matching_bug:
+                    if matching_bug["bug_id"] not in self.discovered_bugs:
+                        reward -= 0.10
+                    else:
+                        self.df["ssn"] = self.df["ssn"].astype(str).str.replace(r"\d", "X", regex=True)
+                        self.pii_masked = True
+                        reward += 0.20
+                else: reward -= 0.05
+            else: reward -= 0.05
 
         elif action.action_type == ActionType.VALIDATE:
             if self.fix_applied and self.pii_masked:
                 self.validation_passed = True
                 self.pipeline_stage_health["stage_4_aggregate"] = 1.0
                 self.pipeline_stage_health["stage_5_output"] = 1.0
+                reward += 0.25
                 reward += 0.30
                 done = True
             else:
-                stages_above_half = sum(1 for v in self.pipeline_stage_health.values() if v >= 0.5)
-                reward += 0.05 * (stages_above_half / 5)
+                reward -= 0.05
 
         elif action.action_type == ActionType.NOOP:
             reward = 0.0
-
         else:
             reward -= 0.10
-
-        if len(self.signals_unlocked) >= 2 and action.action_type in [
-            ActionType.CAST_TYPE,
-            ActionType.MASK_PII,
-            ActionType.VALIDATE,
-        ]:
-            process_bonus = 0.05 * (len(self.signals_unlocked) / 4)
-            reward += process_bonus
 
         self.downstream_health = sum(self.pipeline_stage_health.values()) / 5
         reward = max(-0.5, min(1.0, reward))
@@ -320,32 +290,21 @@ class Task3IncidentEnv:
         done = done or (self.step_count >= self.MAX_STEPS)
 
         aer = AERRecord(
-            step_id=self.step_count,
-            action_type=action.action_type.value,
-            target=action.target_column,
-            justification=action.justification,
-            reward_earned=round(reward, 4),
-            issues_identified=[bug["bug_id"] for bug in self.ground_truth if bug["bug_id"] in self.discovered_bugs],
+            step_id=self.step_count, action_type=action.action_type.value, target=action.target_column, justification=action.justification,
+            reward_earned=round(reward, 4), issues_identified=[bug["bug_id"] for bug in self.ground_truth if bug["bug_id"] in self.discovered_bugs],
             issues_fixed=[
-                bug["bug_id"]
-                for bug in self.ground_truth
-                if (bug["type"] == "type_corruption" and self.fix_applied)
-                or (bug["type"] == "pii_leak" and self.pii_masked)
-            ],
+                bug["bug_id"] for bug in self.ground_truth
+                if (bug["type"] == "type_corruption" and self.fix_applied) or (bug["type"] == "pii_leak" and self.pii_masked)
+            ]
         )
         self.aer_history.append(aer)
 
         return StepResult(
-            observation=self._build_observation(),
-            reward=round(reward, 4),
-            done=done,
+            observation=self._build_observation(), reward=round(reward, 4), done=done,
             info={
-                "diagnosis_correct": self.diagnosis_correct,
-                "fix_applied": self.fix_applied,
-                "pii_masked": self.pii_masked,
-                "validation_passed": self.validation_passed,
-                "signals_unlocked": list(self.signals_unlocked),
-                "stages_inspected": list(self.stages_inspected),
+                "diagnosis_correct": self.diagnosis_correct, "fix_applied": self.fix_applied,
+                "pii_masked": self.pii_masked, "validation_passed": self.validation_passed,
+                "signals_unlocked": list(self.signals_unlocked), "stages_inspected": list(self.stages_inspected),
                 "visible_signals": self.visible_signals.model_dump() if self.visible_signals else {},
                 "aer_last": aer.model_dump(),
             },

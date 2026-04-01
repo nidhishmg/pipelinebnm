@@ -63,6 +63,13 @@ def test_correct_fix_increases_score():
 	score_before = grade_task1(env).score
 	env.step(
 		DataAction(
+			action_type=ActionType.INSPECT,
+			target_column="salary",
+			justification="Checking salary",
+		)
+	)
+	env.step(
+		DataAction(
 			action_type=ActionType.FILL_DEFAULT,
 			target_column="salary",
 			transformation="fill_median",
