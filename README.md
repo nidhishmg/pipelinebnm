@@ -1,4 +1,12 @@
-<<<<<<< HEAD
+---
+title: Broken Pipeline Env
+emoji: 🔧
+colorFrom: red
+colorTo: orange
+sdk: docker
+pinned: false
+---
+
 # DataPipelineEnv
 
 DataPipelineEnv is a production-ready OpenEnv hackathon backend for evaluating
@@ -30,15 +38,3 @@ python inference.py
 ```bash
 python -m pytest tests/test_env.py -v --tb=short
 ```
-=======
----
-title: Broken Pipeline Env
-emoji: ⚡
-colorFrom: blue
-colorTo: gray
-sdk: docker
-pinned: false
----
-
-Check out the configuration reference at https://huggingface.co/docs/hub/spaces-config-reference
->>>>>>> space/main
