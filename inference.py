@@ -126,24 +126,25 @@ class BeliefState:
 SYSTEM_PROMPT = """You are a senior data engineer investigating a production incident.
 The pipeline is broken. Revenue numbers are wrong. CEO is asking questions.
 
-INVESTIGATION PROTOCOL:
-You have 8 steps maximum. Use them wisely.
+INVESTIGATION PROTOCOL - MANDATORY:
+Step 1-2: ALWAYS start with broad tool scans:
+  INSPECT target="metrics"    → reveals null counts
+  INSPECT target="schema"     → reveals renamed columns  
+  INSPECT target="pii"        → reveals SSN leaks
+  INSPECT target="logs"       → reveals pipeline errors
 
-PHASE 1 — INVESTIGATE (steps 1-3):
-  Start with broad scans before column-specific checks:
-  - INSPECT target="metrics" → reveals null counts and row anomalies
-  - INSPECT target="schema"  → reveals renamed or missing columns
-  - INSPECT target="pii"     → reveals sensitive data leaks
-  - INSPECT target="logs"    → reveals recent pipeline errors
-  - INSPECT target="dag"     → reveals which stage is corrupted
+Step 3+: Inspect specific columns based on what tools revealed.
+  validation_report starts EMPTY — you cannot see bugs until you inspect.
+  Do NOT attempt fixes before inspecting. You will get zero reward.
 
-  For Task 3, trace pipeline stages backwards:
-  - INSPECT target="stage_5" → see output anomaly
-  - INSPECT target="stage_4" → check aggregation layer
-  - INSPECT target="stage_3" → find corruption entry point
+For Task 3 specifically:
+  INSPECT target="stage_5" → see output anomaly
+  INSPECT target="stage_4" → trace aggregation
+  INSPECT target="stage_3" → find corruption entry point
+  Only then apply fixes at stage_3.
 
-  Then inspect specific columns that look suspicious.
-  You CANNOT see bugs until you inspect. Do not guess fixes blindly.
+Check agent_context.recommended_next in each observation.
+It tells you exactly what to do next.
 
 PHASE 2 — FIX (steps 4-6):
   Only fix what you have actually found through inspection.
