@@ -34,33 +34,29 @@ load_dotenv()
 
 def get_runtime_config() -> dict[str, str]:
     """Load and validate runtime configuration lazily (import-safe)."""
-    api_base_url = os.getenv("API_BASE_URL")
-    if not api_base_url:
-        raise EnvironmentError(
-            "API_BASE_URL is not set. "
-            "Set it to your HF Space URL or http://localhost:8000"
-        )
+    api_base_url = os.getenv("API_BASE_URL", "http://localhost:7860")
 
-    model_name = os.getenv("MODEL_NAME")
-    if not model_name:
-        raise EnvironmentError(
-            "MODEL_NAME is not set. "
-            "Example: Qwen/Qwen2.5-72B-Instruct"
-        )
-
+    # Spec requires OPENAI_API_KEY — also support HF_TOKEN as fallback
+    openai_key = os.getenv("OPENAI_API_KEY")
     hf_token = os.getenv("HF_TOKEN")
-    if not hf_token:
-        raise EnvironmentError(
-            "HF_TOKEN is not set. "
-            "Set it to your Hugging Face token."
-        )
 
-    llm_base_url = os.getenv("LLM_BASE_URL", "https://router.huggingface.co/v1")
+    if openai_key:
+        token = openai_key
+        llm_base_url = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
+        model_name = os.getenv("MODEL_NAME", "gpt-4o-mini")
+    elif hf_token:
+        token = hf_token
+        llm_base_url = os.getenv("LLM_BASE_URL", "https://router.huggingface.co/v1")
+        model_name = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
+    else:
+        raise EnvironmentError(
+            "Set OPENAI_API_KEY (required by OpenEnv spec) or HF_TOKEN as fallback."
+        )
 
     return {
         "api_base_url": api_base_url,
         "model_name": model_name,
-        "hf_token": hf_token,
+        "token": token,
         "llm_base_url": llm_base_url,
     }
 
@@ -127,37 +123,61 @@ class BeliefState:
 
 
 # -- System prompt ---------------------------------------------------------
-SYSTEM_PROMPT = """You are a senior data engineer on call.
-A production data pipeline is broken. CEO is asking about revenue numbers.
-Investigate systematically before fixing anything.
+SYSTEM_PROMPT = """You are a senior data engineer investigating a production incident.
+The pipeline is broken. Revenue numbers are wrong. CEO is asking questions.
 
-OPTIMAL STRATEGY:
-  Steps 1-2: INSPECT to unlock evidence facets
-             target_column options: "logs", "metrics", "dag", "pii", or a column name
-  Steps 3-5: Apply targeted fixes based on evidence
-  Steps 6-7: VALIDATE to confirm fixes
-  Step 8:    Final VALIDATE or MASK_PII if PII still exposed
+INVESTIGATION PROTOCOL:
+You have 8 steps maximum. Use them wisely.
+
+PHASE 1 — INVESTIGATE (steps 1-3):
+  Start with broad scans before column-specific checks:
+  - INSPECT target="metrics" → reveals null counts and row anomalies
+  - INSPECT target="schema"  → reveals renamed or missing columns
+  - INSPECT target="pii"     → reveals sensitive data leaks
+  - INSPECT target="logs"    → reveals recent pipeline errors
+  - INSPECT target="dag"     → reveals which stage is corrupted
+
+  For Task 3, trace pipeline stages backwards:
+  - INSPECT target="stage_5" → see output anomaly
+  - INSPECT target="stage_4" → check aggregation layer
+  - INSPECT target="stage_3" → find corruption entry point
+
+  Then inspect specific columns that look suspicious.
+  You CANNOT see bugs until you inspect. Do not guess fixes blindly.
+
+PHASE 2 — FIX (steps 4-6):
+  Only fix what you have actually found through inspection.
+  Fix highest severity bugs first (critical > high > medium > low).
+
+  Available fixes:
+  - FILL_DEFAULT target="column" transformation="fill_median" → fix nulls
+  - CAST_TYPE target="column" transformation="cast_to_int/float" → fix types
+  - RENAME_COLUMN target="old_name" transformation="correct_name" → fix schema drift
+  - MASK_PII target="ssn" → fix PII leak (do this immediately if found)
+  - DROP_COLUMN → DANGEROUS, triggers blast radius penalty
+
+PHASE 3 — VALIDATE (steps 7-8):
+  - VALIDATE target="pipeline" → confirms all fixes applied correctly
+  - MASK_PII if not done yet → PII penalty is -0.20, never skip this
 
 CRITICAL RULES:
-  - If you see SSN data anywhere -> MASK_PII on "ssn" IMMEDIATELY
-  - Never DROP_COLUMN without seeing the schema first
-  - Always explain your reasoning in justification
+  - If validation_report is empty, you have NOT inspected yet. INSPECT FIRST.
+  - If you see SSN data anywhere, MASK_PII immediately (next step).
+  - Never DROP_COLUMN without checking schema dependencies first.
+  - Your justification field is graded — explain your reasoning clearly.
+  - Mention specific evidence: "salary column shows 3 NULL values at rows 23,47,89"
 
 OUTPUT: Reply ONLY with valid JSON, zero markdown, zero explanation:
 {
-  "action_type": "INSPECT"|"RENAME_COLUMN"|"CAST_TYPE"|"FILL_DEFAULT"|
-                 "DROP_COLUMN"|"VALIDATE"|"MASK_PII"|"NOOP",
-  "target_column": "column_name" or null,
-  "transformation": "cast_to_int"|"cast_to_float"|"fill_median"|
-                    "fill_zero"|"drop_duplicates" or null,
-  "justification": "One sentence: what you observed and why this action.",
+  "action_type": "INSPECT"|"FILL_DEFAULT"|"CAST_TYPE"|"RENAME_COLUMN"|"VALIDATE"|"MASK_PII"|"DROP_COLUMN"|"NOOP",
+  "target_column": "column_name or facet_name or null",
+  "transformation": "cast_to_int"|"cast_to_float"|"fill_median"|"fill_zero"|"drop_duplicates" or null,
+  "justification": "What evidence you saw and why you chose this action.",
   "identified_issues": [
     {
-      "issue_type": "null_injection"|"type_corruption"|"out_of_range"|
-                    "format_inconsistency"|"schema_drift"|"pii_leak"|
-                    "duplicate_rows",
+      "issue_type": "null_injection"|"type_corruption"|"out_of_range"|"format_inconsistency"|"schema_drift"|"pii_leak"|"duplicate_rows",
       "column": "column_name" or null,
-      "description": "what you found",
+      "description": "specific description of what you observed",
       "severity": "low"|"medium"|"high"|"critical"
     }
   ] or null
@@ -512,7 +532,7 @@ def main() -> None:
     global _EPISODE_START
     config = get_runtime_config()
     client = OpenAI(
-        api_key=config["hf_token"],
+        api_key=config["token"],
         base_url=config["llm_base_url"],
     )
 

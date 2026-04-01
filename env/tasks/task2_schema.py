@@ -5,12 +5,19 @@ from pathlib import Path
 
 import pandas as pd
 
-from env.data.bug_injector import get_failure_signature, inject_bugs, load_scenario
+from env.data.bug_injector import (
+    build_logs_facet,
+    build_metrics_facet,
+    get_failure_signature,
+    inject_bugs,
+    load_scenario,
+)
 from env.data.generator import generate_employee_dataset
 from env.models import (
     AERRecord,
     ActionType,
     AlertSignal,
+    ComplianceFacet,
     DagOverview,
     DataAction,
     DataObservation,
@@ -36,7 +43,9 @@ class Task2SchemaEnv:
         self.df: pd.DataFrame = pd.DataFrame()
         self.ground_truth: list[dict] = []
         self.step_count: int = 0
+        self.identified_bug_ids: set[str] = set()
         self.fixed_bug_ids: set[str] = set()
+        self.discovered_bugs: set[str] = set()          # NEW: progressive discovery
         self.downstream_health: float = 0.0
         self.blast_events: int = 0
         self.visible_signals: VisibleSignals | None = None
@@ -49,7 +58,9 @@ class Task2SchemaEnv:
         clean_df = generate_employee_dataset(seed=42)
         self.df, self.ground_truth = inject_bugs(clean_df, scenario_bugs)
         self.step_count = 0
+        self.identified_bug_ids = set()
         self.fixed_bug_ids = set()
+        self.discovered_bugs = set()                     # NEW: starts empty
         self.downstream_health = 0.0
         self.blast_events: int = 0
 
@@ -109,7 +120,68 @@ class Task2SchemaEnv:
             if b.get("type") == "schema_drift"
         }
 
-        if action.action_type == ActionType.DROP_COLUMN:
+        if action.action_type == ActionType.INSPECT:
+            target = (action.target_column or "").lower()
+
+            # --- Tool target aliases (callable tool names → facet targets) ---
+            _TOOL_ALIASES = {
+                "run_null_check": "metrics",
+                "run_type_check": "schema",
+                "run_duplicate_check": "metrics",
+                "run_pii_scan": "pii",
+                "run_schema_diff": "schema",
+                "trace_pipeline_stage": "dag",
+            }
+            target = _TOOL_ALIASES.get(target, target)
+
+            # --- Facet-level inspection ---
+            if target == "metrics" and "metrics" not in self.signals_unlocked:
+                self.visible_signals.metrics = build_metrics_facet(self.df)
+                self.signals_unlocked.add("metrics")
+                reward += 0.05
+            elif target == "logs" and "logs" not in self.signals_unlocked:
+                self.visible_signals.logs = build_logs_facet(
+                    ["SchemaError: column employee_id not found", "Warning: consent_flag all NULL"]
+                )
+                self.signals_unlocked.add("logs")
+                reward += 0.05
+            elif target in ["pii", "ssn", "compliance"] and "compliance" not in self.signals_unlocked:
+                pii_cols = [col for col in self.df.columns if "ssn" in col.lower()]
+                self.visible_signals.compliance = ComplianceFacet(
+                    pii_detected=len(pii_cols) > 0,
+                    risky_columns=pii_cols,
+                )
+                self.signals_unlocked.add("compliance")
+                reward += 0.05
+            elif target == "schema" and "schema" not in self.signals_unlocked:
+                # Reveal ALL schema_drift bugs at once
+                for bug in self.ground_truth:
+                    if bug["type"] == "schema_drift" and bug["bug_id"] not in self.discovered_bugs:
+                        self.discovered_bugs.add(bug["bug_id"])
+                        self.identified_bug_ids.add(bug["bug_id"])
+                        reward += 0.10
+                self.signals_unlocked.add("schema")
+                reward += 0.05
+            else:
+                # --- Column-specific inspection ---
+                found_any = False
+                for bug in self.ground_truth:
+                    bug_col = (bug.get("column") or "").lower()
+                    # Also match new_col / old_col for schema_drift bugs
+                    drift_cols = [
+                        (bug.get("new_col") or "").lower(),
+                        (bug.get("old_col") or "").lower(),
+                    ]
+                    match_cols = ([bug_col] if bug_col else []) + drift_cols
+                    if target in match_cols and bug["bug_id"] not in self.discovered_bugs:
+                        self.discovered_bugs.add(bug["bug_id"])
+                        self.identified_bug_ids.add(bug["bug_id"])
+                        reward += 0.15
+                        found_any = True
+                if not found_any:
+                    reward -= 0.03
+
+        elif action.action_type == ActionType.DROP_COLUMN:
             dependents = self.COLUMN_DEPENDENCIES.get(action.target_column, [])
             if dependents:
                 penalty = -0.10 * len(dependents)
@@ -170,16 +242,41 @@ class Task2SchemaEnv:
         self.downstream_health = len(self.fixed_bug_ids) / self.TOTAL_BUGS
         done = done or (self.step_count >= self.MAX_STEPS)
 
+        aer = AERRecord(
+            step_id=self.step_count,
+            action_type=action.action_type.value,
+            target=action.target_column,
+            justification=action.justification,
+            reward_earned=round(reward, 4),
+            issues_identified=list(self.identified_bug_ids),
+            issues_fixed=list(self.fixed_bug_ids),
+        )
+        self.aer_history.append(aer)
+
         return StepResult(
             observation=self._build_observation(),
             reward=round(reward, 4),
             done=done,
-            info={"blast_events": self.blast_events, "fixed": list(self.fixed_bug_ids)},
+            info={
+                "blast_events": self.blast_events,
+                "fixed": list(self.fixed_bug_ids),
+                "identified": list(self.identified_bug_ids),
+                "signals_unlocked": list(self.signals_unlocked),
+                "visible_signals": self.visible_signals.model_dump() if self.visible_signals else {},
+                "aer_last": aer.model_dump(),
+            },
         )
 
     def _build_observation(self) -> DataObservation:
-        """Construct DataObservation from current dataframe and unresolved bugs."""
-        unresolved = [t for t in self.ground_truth if t["bug_id"] not in self.fixed_bug_ids]
+        """Construct DataObservation from current dataframe.
+
+        Progressive discovery: only bugs in `discovered_bugs` AND not yet
+        fixed are shown in validation_report.  At reset this is empty.
+        """
+        visible_bugs = [
+            t for t in self.ground_truth
+            if t["bug_id"] in self.discovered_bugs and t["bug_id"] not in self.fixed_bug_ids
+        ]
         validation_report = [
             DetectedIssue(
                 issue_type=b["type"],
@@ -187,12 +284,31 @@ class Task2SchemaEnv:
                 description=b["description"],
                 severity=b["severity"],
             )
-            for b in unresolved
+            for b in visible_bugs
         ]
 
         schema_dict = {
             col: {"type": str(dtype), "nullable": bool(self.df[col].isna().any())}
             for col, dtype in self.df.dtypes.items()
+        }
+
+        agent_context = {
+            "inspected_columns": sorted(
+                {(b.get("column") or b.get("new_col") or "").lower()
+                 for b in self.ground_truth if b["bug_id"] in self.discovered_bugs}
+                | self.signals_unlocked
+            ),
+            "bugs_found": [
+                f"{b['type']}:{b.get('column') or b.get('new_col', 'N/A')}"
+                for b in self.ground_truth
+                if b["bug_id"] in self.discovered_bugs
+            ],
+            "bugs_fixed": [
+                f"{b['type']}:{b.get('column') or b.get('new_col', 'N/A')}"
+                for b in self.ground_truth
+                if b["bug_id"] in self.fixed_bug_ids
+            ],
+            "tools_available": ["metrics", "logs", "dag", "pii", "schema"],
         }
 
         return DataObservation(
@@ -205,6 +321,7 @@ class Task2SchemaEnv:
             step_count=self.step_count,
             task_id=2,
             pipeline_stage_health=None,
+            agent_context=agent_context,
         )
 
     def state(self) -> DataObservation:

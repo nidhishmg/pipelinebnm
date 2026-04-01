@@ -46,6 +46,7 @@ class DataObservation(BaseModel):
     step_count: int
     task_id: int
     pipeline_stage_health: Optional[dict[str, float]] = None
+    agent_context: Optional[dict] = None
 
 
 class StepResult(BaseModel):

@@ -41,6 +41,7 @@ class Task1AuditEnv:
         self.step_count: int = 0
         self.identified_bug_ids: set[str] = set()
         self.fixed_bug_ids: set[str] = set()
+        self.discovered_bugs: set[str] = set()          # NEW: progressive discovery
         self.downstream_health: float = 0.0
         self.visible_signals: VisibleSignals | None = None
         self.signals_unlocked: set[str] = set()
@@ -55,6 +56,7 @@ class Task1AuditEnv:
         self.step_count = 0
         self.identified_bug_ids = set()
         self.fixed_bug_ids = set()
+        self.discovered_bugs = set()                     # NEW: starts empty
         self.downstream_health = 0.0
 
         failure_sig = get_failure_signature(self.ground_truth)
@@ -78,6 +80,18 @@ class Task1AuditEnv:
         if action.action_type == ActionType.INSPECT:
             target = (action.target_column or "").lower()
 
+            # --- Tool target aliases (callable tool names → facet targets) ---
+            _TOOL_ALIASES = {
+                "run_null_check": "metrics",
+                "run_type_check": "schema",
+                "run_duplicate_check": "metrics",
+                "run_pii_scan": "pii",
+                "run_schema_diff": "schema",
+                "trace_pipeline_stage": "dag",
+            }
+            target = _TOOL_ALIASES.get(target, target)
+
+            # --- Facet-level inspection (unlock observability signals) ---
             if target == "metrics" and "metrics" not in self.signals_unlocked:
                 self.visible_signals.metrics = build_metrics_facet(self.df)
                 self.signals_unlocked.add("metrics")
@@ -102,7 +116,28 @@ class Task1AuditEnv:
                 )
                 self.signals_unlocked.add("compliance")
                 reward += 0.05
+            elif target == "schema" and "schema" not in self.signals_unlocked:
+                # Reveal schema-drift bugs
+                for bug in self.ground_truth:
+                    if bug["type"] == "schema_drift" and bug["bug_id"] not in self.discovered_bugs:
+                        self.discovered_bugs.add(bug["bug_id"])
+                        reward += 0.10
+                self.signals_unlocked.add("schema")
+                reward += 0.05
+            else:
+                # --- Column-specific inspection (progressive bug discovery) ---
+                found_any = False
+                for bug in self.ground_truth:
+                    bug_col = (bug.get("column") or "").lower()
+                    if bug_col and bug_col == target and bug["bug_id"] not in self.discovered_bugs:
+                        self.discovered_bugs.add(bug["bug_id"])
+                        self.identified_bug_ids.add(bug["bug_id"])
+                        reward += 0.15
+                        found_any = True
+                if not found_any:
+                    reward -= 0.03  # wasted inspection step
 
+            # Legacy: also credit inline identified_issues from agent
             for issue in (action.identified_issues or []):
                 for truth in self.ground_truth:
                     if matches_ground_truth(issue, truth) and truth["bug_id"] not in self.identified_bug_ids:
@@ -211,8 +246,16 @@ class Task1AuditEnv:
         )
 
     def _build_observation(self) -> DataObservation:
-        """Construct a DataObservation from current in-memory state."""
-        unfixed_bugs = [t for t in self.ground_truth if t["bug_id"] not in self.fixed_bug_ids]
+        """Construct a DataObservation from current in-memory state.
+
+        Progressive discovery: only bugs in `discovered_bugs` AND not yet
+        fixed are shown in validation_report.  At reset this is empty.
+        """
+        # Only show bugs the agent has actually discovered via INSPECT
+        visible_bugs = [
+            t for t in self.ground_truth
+            if t["bug_id"] in self.discovered_bugs and t["bug_id"] not in self.fixed_bug_ids
+        ]
         validation_report = [
             DetectedIssue(
                 issue_type=b["type"],
@@ -220,7 +263,7 @@ class Task1AuditEnv:
                 description=b["description"],
                 severity=b["severity"],
             )
-            for b in unfixed_bugs
+            for b in visible_bugs
         ]
 
         schema_dict = {
@@ -229,6 +272,25 @@ class Task1AuditEnv:
                 "nullable": bool(self.df[col].isna().any()),
             }
             for col, dtype in self.df.dtypes.items()
+        }
+
+        # Build agent_context for belief tracking
+        agent_context = {
+            "inspected_columns": sorted(
+                {(b.get("column") or "").lower() for b in self.ground_truth if b["bug_id"] in self.discovered_bugs}
+                | self.signals_unlocked
+            ),
+            "bugs_found": [
+                f"{b['type']}:{b.get('column', 'N/A')}"
+                for b in self.ground_truth
+                if b["bug_id"] in self.discovered_bugs
+            ],
+            "bugs_fixed": [
+                f"{b['type']}:{b.get('column', 'N/A')}"
+                for b in self.ground_truth
+                if b["bug_id"] in self.fixed_bug_ids
+            ],
+            "tools_available": ["metrics", "logs", "dag", "pii", "schema"],
         }
 
         return DataObservation(
@@ -241,6 +303,7 @@ class Task1AuditEnv:
             step_count=self.step_count,
             task_id=1,
             pipeline_stage_health=None,
+            agent_context=agent_context,
         )
 
     def state(self) -> DataObservation:
