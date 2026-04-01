@@ -55,7 +55,7 @@ def inject_bugs(df: pd.DataFrame, bug_spec: list[dict]) -> tuple[pd.DataFrame, l
         "duplicate_rows",
     ]
 
-    corrupted = df.copy()
+    corrupted = df.copy().astype(object)
     ground_truth: list[dict] = []
 
     for bug_type in INJECTION_ORDER:

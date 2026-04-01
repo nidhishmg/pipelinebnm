@@ -4,7 +4,7 @@
       "bug_id": "B001",
       "type": "schema_drift",
       "stage": "stage_3_join",
-      "old_col": "revenue_amount",
+      "old_col": "salary",
       "new_col": "rev_amt",
       "severity": "critical",
       "description": "revenue_amount renamed to rev_amt at join stage"

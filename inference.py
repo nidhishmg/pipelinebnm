@@ -24,9 +24,12 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import requests as http
+from dotenv import load_dotenv
 from openai import OpenAI
 
 from env.models import ActionType
+
+load_dotenv()
 
 
 def get_runtime_config() -> dict[str, str]:

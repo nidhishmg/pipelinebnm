@@ -37,7 +37,7 @@ def generate_employee_dataset(n_rows: int = 200, seed: int = 42) -> pd.DataFrame
             "consent_flag": rng.choice([True, False], n_rows).tolist(),
         }
     )
-    return df
+    return df.astype(object)
 
 
 if __name__ == "__main__":
