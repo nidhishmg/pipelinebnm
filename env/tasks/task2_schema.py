@@ -14,6 +14,7 @@ from env.data.bug_injector import (
     load_scenario,
 )
 from env.data.generator import generate_employee_dataset
+from env.data.scenario_generator import generate_scenario
 from env.models import (
     AERRecord,
     ActionType,
@@ -57,16 +58,23 @@ class Task2SchemaEnv:
         self.current_scenario_path: Path | None = None
         self.inspected_targets: set[str] = set()
 
-    def reset(self) -> DataObservation:
-        """Reset state and initialize a fresh corrupted Task2 dataframe."""
-        scenario_files = sorted(self.SCENARIO_DIR.glob("task2_scenario*.json"))
-        chosen = random.choice(scenario_files)
-        self.current_scenario_path = chosen
-        # Reload dependencies from chosen scenario
-        with chosen.open("r", encoding="utf-8") as handle:
-            payload = json.load(handle)
-        self.COLUMN_DEPENDENCIES = payload.get("column_dependencies", self.COLUMN_DEPENDENCIES)
-        scenario_bugs = load_scenario(str(chosen))
+    def reset(self, scenario_override: str | None = None) -> DataObservation:
+        """Reset state with a fresh procedurally generated scenario.
+        
+        Args:
+            scenario_override: Path to a specific scenario JSON. Used by /demo only.
+        """
+        if scenario_override:
+            self.current_scenario_path = Path(scenario_override)
+            with self.current_scenario_path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            self.COLUMN_DEPENDENCIES = payload.get("column_dependencies", self.COLUMN_DEPENDENCIES)
+            scenario_bugs = load_scenario(scenario_override)
+        else:
+            import random as _random
+            ep_seed = _random.randint(0, 9999)
+            scenario_bugs = generate_scenario(ep_seed, task_id=2, difficulty="medium")
+            self.current_scenario_path = None
         clean_df = generate_employee_dataset(seed=42)
         self.df, self.ground_truth = inject_bugs(clean_df, scenario_bugs)
         self.step_count = 0
@@ -126,8 +134,7 @@ class Task2SchemaEnv:
         reward = 0.0
         done = False
 
-        scenario_bugs = load_scenario(str(self.current_scenario_path))
-        expected_renames = {b["new_col"]: b["old_col"] for b in scenario_bugs if b.get("type") == "schema_drift"}
+        expected_renames = {b["new_col"]: b["old_col"] for b in self.ground_truth if b.get("type") == "schema_drift"}
 
         if action.action_type == ActionType.INSPECT:
             target = (action.target_column or "").lower()
@@ -325,6 +332,7 @@ class Task2SchemaEnv:
             downstream_health=self.downstream_health,
             step_count=self.step_count,
             task_id=2,
+            max_steps=self.MAX_STEPS,
             pipeline_stage_health=None,
             agent_context=agent_context,
         )

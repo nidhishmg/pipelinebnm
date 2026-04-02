@@ -136,7 +136,7 @@ class TestGrader3:
         env = Task3IncidentEnv()
         env.reset()
         env.diagnosis_correct = True
-        env.fix_applied = True
+        env.fixes_applied = env.REQUIRED_FIXES
         env.pii_masked = True
         env.validation_passed = True
         result = grade_task3(env)
@@ -504,7 +504,7 @@ class TestGrader3Bonuses:
         env = Task3IncidentEnv()
         env.reset()
         env.diagnosis_correct = True
-        env.fix_applied = True
+        env.fixes_applied = env.REQUIRED_FIXES
         env.pii_masked = True
         env.validation_passed = True
         env.step_count = 3

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import threading
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
@@ -14,8 +17,34 @@ from env.tasks.task2_schema import Task2SchemaEnv
 from env.tasks.task3_incident import Task3IncidentEnv
 
 
+# STATE ISOLATION WARNING:
+# _envs is a module-level dict. This server must run with --workers 1.
+# Multi-worker deployment will cause cross-request state corruption.
+# For multi-worker support, replace _envs with Redis-backed session storage.
 _envs: dict[int, object] = {}
-_leaderboard: list[dict] = []
+
+# --- File-backed leaderboard ------------------------------------------------
+_LEADERBOARD_PATH = Path("leaderboard.json")
+_leaderboard_lock = threading.Lock()
+
+def _load_leaderboard() -> list[dict]:
+    """Load leaderboard from disk, or start fresh."""
+    if _LEADERBOARD_PATH.exists():
+        try:
+            return json.loads(_LEADERBOARD_PATH.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, IOError):
+            return []
+    return []
+
+_leaderboard: list[dict] = _load_leaderboard()
+
+def _persist_leaderboard() -> None:
+    """Write leaderboard to disk inside lock."""
+    with _leaderboard_lock:
+        _LEADERBOARD_PATH.write_text(
+            json.dumps(_leaderboard[-200:], indent=2), encoding="utf-8"
+        )
+
 
 
 @asynccontextmanager
@@ -183,20 +212,15 @@ def demo() -> dict[str, Any]:
     """
     # Create a fresh isolated env — never mutate shared _envs[1]
     from env.tasks.task1_audit import Task1AuditEnv
+    from pathlib import Path
     
     demo_env = Task1AuditEnv()
     
-    # Force base scenario by temporarily overriding SCENARIO_DIR
-    import random
-    _orig = random.choice
-    def _pick_base(seq):
-        base = [f for f in seq if f.name == "task1_scenario.json"]
-        return base[0] if base else seq[0]
-    random.choice = _pick_base
-    try:
-        obs = demo_env.reset()
-    finally:
-        random.choice = _orig
+    # Use scenario_override for clean, concurrent-safe base scenario (Fix 6.3)
+    base_scenario = str(
+        Path(__file__).parent / "data" / "scenarios" / "task1_scenario.json"
+    )
+    obs = demo_env.reset(scenario_override=base_scenario)
     
     trace = []
     
@@ -288,14 +312,16 @@ def leaderboard() -> dict[str, Any]:
 def record_score(entry: dict) -> dict[str, Any]:
     """Record a score from an agent run for leaderboard tracking."""
     import datetime
-    _leaderboard.append({
-        "timestamp": datetime.datetime.utcnow().isoformat(),
-        "task_1": entry.get("task_1", 0.0),
-        "task_2": entry.get("task_2", 0.0),
-        "task_3": entry.get("task_3", 0.0),
-        "average": entry.get("average", 0.0),
-        "model": entry.get("model", "unknown"),
-    })
+    with _leaderboard_lock:
+        _leaderboard.append({
+            "timestamp": datetime.datetime.utcnow().isoformat(),
+            "task_1": entry.get("task_1", 0.0),
+            "task_2": entry.get("task_2", 0.0),
+            "task_3": entry.get("task_3", 0.0),
+            "average": entry.get("average", 0.0),
+            "model": entry.get("model", "unknown"),
+        })
+    _persist_leaderboard()
     return {"recorded": True, "total_entries": len(_leaderboard)}
 
 
@@ -331,12 +357,38 @@ def state(task_id: int = 1) -> dict[str, Any]:
 @app.get("/grader", response_model=GraderResult)
 def grader(task_id: int = 1) -> GraderResult:
     if task_id == 1:
-        return grade_task1(_envs[1])
-    if task_id == 2:
-        return grade_task2(_envs[2])
-    if task_id == 3:
-        return grade_task3(_envs[3])
-    raise HTTPException(status_code=404, detail=f"task_id {task_id} not found")
+        result = grade_task1(_envs[1])
+    elif task_id == 2:
+        result = grade_task2(_envs[2])
+    elif task_id == 3:
+        result = grade_task3(_envs[3])
+    else:
+        raise HTTPException(status_code=404, detail=f"task_id {task_id} not found")
+    # Persist score to leaderboard.json on every /grader call
+    import datetime
+    with _leaderboard_lock:
+        _leaderboard.append({
+            "timestamp": datetime.datetime.utcnow().isoformat(),
+            "task_id": task_id,
+            "score": result.score,
+            "breakdown": result.breakdown,
+            "source": "grader_endpoint",
+        })
+    _persist_leaderboard()
+    return result
+
+
+@app.get("/.well-known/env-info")
+def well_known_env_info() -> dict[str, Any]:
+    """Machine-readable deployment info for judges and validators."""
+    return {
+        "workers": 1,
+        "state_backend": "in-process",
+        "leaderboard_backend": "file",
+        "leaderboard_path": str(_LEADERBOARD_PATH),
+        "note": "Restart retains leaderboard (file-backed). State is per-worker in-memory; multi-worker deploy would require Redis.",
+    }
+
 
 
 @app.get("/baseline")

@@ -61,11 +61,13 @@ def get_runtime_config() -> dict[str, str]:
     }
 
 
-# -- Constants -------------------------------------------------------------
-MAX_STEPS = 8
+# -- Constants (defaults; per-task values read from /reset response) -------
+# MAX_STEPS is NOT hardcoded here — each task exposes its own max_steps.
+# This value is used only as a fallback when /reset doesn't include it.
+_DEFAULT_MAX_STEPS = 20
 MAX_PARSE_RETRIES = 2
 ROLLING_WINDOW = 6
-COMPACTION_STEP = 5
+# COMPACTION_STEP is derived dynamically: max(5, max_steps // 3)
 MAX_RUNTIME_SECS = 19 * 60
 HTTP_TIMEOUT = 30
 
@@ -409,7 +411,7 @@ def _compaction_summary(belief_state: dict, step_errors: list[str]) -> str:
         signals_unlocked=list(belief_state.get("signals_unlocked", [])),
         step_errors=list(step_errors),
     )
-    return _build_escalation_summary(state, COMPACTION_STEP)
+    return _build_escalation_summary(state, 5)
 
 
 # -- Episode loop ----------------------------------------------------------
@@ -423,16 +425,25 @@ def run_episode(task_id: int, config: dict[str, str], client: OpenAI) -> float:
     )
     resp.raise_for_status()
     obs = resp.json()
-    obs["visible_signals"] = obs.get("info", {}).get("visible_signals", {})
+    # Fix 2.3: visible_signals always empty at reset (no step has occurred).
+    # Only populate from StepResult.info starting at step 1.
+    obs["visible_signals"] = {}
+
+    # Fix 1.2: read per-task max_steps from /reset response; fall back to 20
+    max_steps = int(obs.get("time_remaining", _DEFAULT_MAX_STEPS) or _DEFAULT_MAX_STEPS)
+    if max_steps <= 0:
+        max_steps = _DEFAULT_MAX_STEPS
+    compaction_step = max(5, max_steps // 3)
+    print(f"  [INFO] Task {task_id}: max_steps={max_steps}, compaction_step={compaction_step}, initial_signals=[]")
 
     system_msg = {"role": "system", "content": SYSTEM_PROMPT}
     messages = [system_msg]
     belief = BeliefState()
 
-    for step_num in range(MAX_STEPS):
+    for step_num in range(max_steps):
         _check_runtime()
 
-        if step_num == COMPACTION_STEP:
+        if step_num == compaction_step:
             summary = _build_escalation_summary(belief, step_num)
             non_sys = [m for m in messages if m["role"] != "system"]
             last_two = non_sys[-2:] if len(non_sys) >= 2 else non_sys

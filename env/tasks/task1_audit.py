@@ -14,6 +14,7 @@ from env.data.bug_injector import (
     matches_ground_truth,
 )
 from env.data.generator import generate_employee_dataset
+from env.data.scenario_generator import generate_scenario
 from env.models import (
     AERRecord,
     ActionType,
@@ -50,11 +51,20 @@ class Task1AuditEnv:
         self.step_errors: list[str] = []
         self.inspected_targets: set[str] = set()
 
-    def reset(self) -> DataObservation:
-        """Reset state, generate deterministic data, inject bugs, and return observation."""
-        scenario_files = sorted(self.SCENARIO_DIR.glob("task1_scenario*.json"))
-        chosen = random.choice(scenario_files)
-        scenario = load_scenario(str(chosen))
+    def reset(self, scenario_override: str | None = None) -> DataObservation:
+        """Reset state with a fresh procedurally generated scenario.
+        
+        Args:
+            scenario_override: If provided, load this specific scenario JSON file.
+                               Used only by /demo for deterministic traces.
+        """
+        if scenario_override:
+            scenario = load_scenario(scenario_override)
+        else:
+            # Procedural generation: fresh seed each episode
+            import random as _random
+            ep_seed = _random.randint(0, 9999)
+            scenario = generate_scenario(ep_seed, task_id=1, difficulty="easy")
         clean_df = generate_employee_dataset(seed=42)
         self.df, self.ground_truth = inject_bugs(clean_df, scenario)
         self.step_count = 0
@@ -97,7 +107,7 @@ class Task1AuditEnv:
 
             reinspecting = target in self.inspected_targets
             if reinspecting:
-                reward -= 0.05
+                reward -= 0.10   # raised from -0.05 (Fix 4.2)
             else:
                 self.inspected_targets.add(target)
 
@@ -297,6 +307,7 @@ class Task1AuditEnv:
             downstream_health=self.downstream_health,
             step_count=self.step_count,
             task_id=1,
+            max_steps=self.MAX_STEPS,
             pipeline_stage_health=None,
             agent_context=agent_context,
         )

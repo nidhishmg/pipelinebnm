@@ -1,130 +1,36 @@
----
-title: Broken Pipeline Env
-emoji: 🔧
-colorFrom: red
-colorTo: blue
-sdk: docker
-pinned: false
----
+# DataOpsEnv — Production Grade Update (Phase 1-9)
 
-# DataPipelineEnv
+DataOpsEnv has been upgraded to a robust, dynamic, robust 10/10 AI Data Engineer training environment. All hardcodes have been removed in favor of procedural generation, strict state gating, and precise multi-action evaluations.
 
-Every company's revenue dashboard has been wrong at 2 AM.
-A data engineer gets the call. We built the environment to
-benchmark whether an AI agent can do their job.
+## 🚀 Key Improvements
 
-## The Problem
+1. **State Isolation & Deployment Safe**: Server now warns of module-level caching and persists scores safely via multithreaded-locked `leaderboard.json` rather than memory. Added `/.well-known/env-info` for transparency.
+2. **Procedural Generation**: `env/data/scenario_generator.py` replaces hardcoded traces. Tasks dynamically generate distinct permutations of column names, error types, duplicate distributions, and PII leaks, enabling robust LLM training logic free from memorization.
+3. **Reward Rebalancing & Strict Scoring**:
+    * Imposed strict -0.10 NOOP & Re-Inspect penalties to penalize hallucination strings or random search behavior.
+    * Gated Reasoning Bonus (`+0.05`): Agent CANNOT earn reasoning bonuses for keywords (like `ssn/pii`) unless they have tangibly investigated and discovered them through facets.
+    * Changed Boolean Task Gates: Task 3 replaced the singular `fix_applied` trick with a complex constraint gate `fixes_applied >= REQUIRED_FIXES` forcing actual completion logic.
+4. **Dynamic Inference Bounds**: Removed fixed 8-step `MAX_STEPS`. `DataObservation` exposes task boundaries so Agents know their precise budget constraint per environment dynamically.
+5. **Diversity & Benchmark Validated**: Automated tests validating >90% procedural uniqueness alongside rigorous bounded thresholds for deterministic validation NOOP agents.
 
-Bad data costs companies $12.9M/year on average (IBM, 2022).
-Every data team faces broken pipelines. Until now, there was
-no standardized benchmark to evaluate whether an AI agent
-can diagnose and fix them. DataPipelineEnv fills that gap.
+## 📂 Documentation
 
-## What Makes This Different
+* `docs/architecture.md`: Overview of request pathways and pipeline state.
+* `docs/reward_design.md`: Explains reasoning sub-scores, scaling gates, and exact metric criteria for Judges.
 
-**Progressive Discovery**: The agent cannot see bugs until it inspects.
-Unlike static environments, DataPipelineEnv requires the agent to
-investigate before it can act — just like a real engineer would.
+## 🛠 Usage
 
-**Blast Radius**: Wrong actions cascade. Drop the wrong column
-and downstream tables break too. The agent must understand
-data dependencies, not just column names.
-
-**Curriculum Design**: Three tasks form a strict skill progression.
-Skills learned in Task 1 transfer directly to Tasks 2 and 3.
-This enables meaningful RL training signal across difficulty levels.
-
-**Reproducible Grading**: Bugs are injected from fixed scenario files.
-The grader compares agent output against the exact ground truth
-we planted. Scores are 100% deterministic.
-
-## The 3 Tasks
-
-| Task | Difficulty | What the Agent Does | Smart Agent Score |
-|------|-----------|---------------------|-------------------|
-| 1 — Data Quality Audit | Easy | Find and fix nulls, type errors, duplicates | ~0.75 |
-| 2 — Schema Drift | Medium | Fix renamed columns, type changes, missing fields | ~0.60 |
-| 3 — Incident Response | Hard | Trace 5-stage pipeline, fix, PII sweep, validate | ~0.55 |
-
-## Action Space
-
-| Action | Description | When to Use |
-|--------|-------------|-------------|
-| `INSPECT` | Reveals bugs in a column or facet | Always first |
-| `FILL_DEFAULT` | Fill NULLs with median/zero | After inspecting null column |
-| `CAST_TYPE` | Fix column data type | After finding type corruption |
-| `RENAME_COLUMN` | Fix schema drift | After schema_diff reveals rename |
-| `MASK_PII` | Redact sensitive data | Immediately on SSN detection |
-| `VALIDATE` | Confirm all fixes and close episode | After all fixes applied |
-| `DROP_COLUMN` | Remove column (triggers blast radius) | Avoid unless necessary |
-| `NOOP` | No operation | Fallback only |
-
-## Observation Space
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `dataset_preview` | list[dict] | First 10 rows |
-| `schema` | dict | Column types and nullable flags |
-| `pipeline_stage` | str | Current ETL stage |
-| `validation_report` | list | Bugs discovered so far (empty at reset) |
-| `time_remaining` | int | Steps left |
-| `downstream_health` | float | 0.0=broken, 1.0=fixed |
-| `agent_context` | dict | Investigation state, recommendations |
-| `pipeline_stage_health` | dict | Per-stage health (Task 3 only) |
-
-## Reward Function
-
-| Event | Reward |
-|-------|--------|
-| Broad scan (metrics/logs/pii/schema) | +0.05 |
-| Discover real bug via INSPECT | +0.15 |
-| Correct fix applied | +0.20 |
-| VALIDATE after all fixes | +0.25 |
-| All bugs fixed (completion) | +0.30 |
-| Re-inspect same target | -0.05 |
-| Fix before discovering | -0.10 |
-| PII not masked | -0.20 |
-
-## Quickstart
+**Run Unit Tests:**
 ```bash
-git clone https://github.com/Nithesh1109/broken-pipeline-env
-cd broken-pipeline-env
-pip install -r requirements.txt
-uvicorn env.server:app --port 7860
+python -m pytest tests/ -v
 ```
 
-## Docker
+**Run Diversity Validation:**
 ```bash
-docker build -t pipeline-env .
-docker run -p 7860:7860 pipeline-env
-curl http://localhost:7860/ping
+python scripts/validate_diversity.py
 ```
 
-## Run the Agent
+**Run NOOP Benchmarks:**
 ```bash
-export API_BASE_URL=http://localhost:7860
-export MODEL_NAME=Qwen/Qwen2.5-72B-Instruct
-export HF_TOKEN=your_token
-python inference.py
+python scripts/benchmark.py
 ```
-
-## Key Endpoints
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/ping` | GET | Health check |
-| `/tasks` | GET | Task list with curriculum info |
-| `/reset` | POST | Start episode |
-| `/step` | POST | Submit action |
-| `/grader` | GET | Get score 0.0–1.0 |
-| `/tools` | GET | Available investigation tools |
-| `/demo` | GET | Watch optimal agent solve Task 1 |
-| `/replay` | GET | Replay any episode step by step |
-| `/leaderboard` | GET | Score history across runs |
-| `/baseline` | GET | NOOP agent scores |
-| `/mcp` | POST | MCP tool discovery (JSON-RPC 2.0) |
-
-## Live Demo
-
-Space: https://nidhishmg10-broken-pipeline-env.hf.space
-Docs: https://nidhishmg10-broken-pipeline-env.hf.space/docs

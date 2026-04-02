@@ -127,6 +127,8 @@ def inject_bugs(df: pd.DataFrame, bug_spec: list[dict]) -> tuple[pd.DataFrame, l
                     "description": bug.get("description", ""),
                     "severity": bug.get("severity", "medium"),
                     "affected_rows": affected_rows,
+                    "old_col": bug.get("old_col"),
+                    "new_col": bug.get("new_col"),
                 }
             )
 

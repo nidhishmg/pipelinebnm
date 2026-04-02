@@ -45,6 +45,7 @@ class DataObservation(BaseModel):
     downstream_health: float
     step_count: int
     task_id: int
+    max_steps: int = 8  # Per-task step budget exposed to agents via /reset
     pipeline_stage_health: Optional[dict[str, float]] = None
     agent_context: Optional[dict] = None
 

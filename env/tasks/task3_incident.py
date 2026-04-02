@@ -13,6 +13,7 @@ from env.data.bug_injector import (
     load_scenario,
 )
 from env.data.generator import generate_employee_dataset
+from env.data.scenario_generator import generate_scenario
 from env.models import (
     AERRecord,
     ActionType,
@@ -80,6 +81,9 @@ class Task3IncidentEnv:
         },
     }
 
+    # Required fixes to gate VALIDATE — frozenset so it's immutable per scenario
+    REQUIRED_FIXES: frozenset[str] = frozenset({"revenue_renamed", "type_cast", "pii_masked"})
+
     def __init__(self) -> None:
         """Initialize mutable state containers for incident simulation."""
         self.df: pd.DataFrame = pd.DataFrame()
@@ -87,7 +91,9 @@ class Task3IncidentEnv:
         self.step_count: int = 0
 
         self.diagnosis_correct: bool = False
-        self.fix_applied: bool = False
+        # Multi-action fix tracker — replaces single fix_applied boolean
+        # Tags: "revenue_renamed", "type_cast", "pii_masked"
+        self.fixes_applied: set[str] = set()
         self.pii_masked: bool = False
         self.validation_passed: bool = False
 
@@ -102,18 +108,25 @@ class Task3IncidentEnv:
         self.inspected_targets: set[str] = set()         # NEW: track stage investigation
         self.aer_history: list[AERRecord] = []
 
-    def reset(self) -> DataObservation:
-        """Reset state, build deterministic dataset, inject bugs, and return observation."""
+    def reset(self, scenario_override: str | None = None) -> DataObservation:
+        """Reset state with a fresh procedurally generated incident scenario.
+        
+        Args:
+            scenario_override: Path to a specific JSON scenario. Used by /demo only.
+        """
         clean_df = generate_employee_dataset(seed=42)
         clean_df["revenue_amount"] = (clean_df["salary"].astype(float) * 1.35).round(2)
-        scenario_files = sorted(self.SCENARIO_DIR.glob("task3_scenario*.json"))
-        chosen = random.choice(scenario_files)
-        scenario_bugs = load_scenario(str(chosen))
+        if scenario_override:
+            scenario_bugs = load_scenario(scenario_override)
+        else:
+            import random as _random
+            ep_seed = _random.randint(0, 9999)
+            scenario_bugs = generate_scenario(ep_seed, task_id=3, difficulty="hard")
         self.df, self.ground_truth = inject_bugs(clean_df, scenario_bugs)
 
         self.step_count = 0
         self.diagnosis_correct = False
-        self.fix_applied = False
+        self.fixes_applied = set()        # reset multi-fix tracker
         self.pii_masked = False
         self.validation_passed = False
         self.zombie_partition_active = False
@@ -162,7 +175,7 @@ class Task3IncidentEnv:
             if target in _TOOL_ALIASES: target = _TOOL_ALIASES[target]
 
             reinspecting = target in self.inspected_targets
-            if reinspecting: reward -= 0.05
+            if reinspecting: reward -= 0.10   # raised from -0.05 (Fix 4.2)
             else: self.inspected_targets.add(target)
 
             stage_key = None
@@ -232,8 +245,11 @@ class Task3IncidentEnv:
                     if matching_bug["bug_id"] not in self.discovered_bugs:
                         reward -= 0.10
                     else:
-                        if "rev_amt" in self.df.columns and "revenue_amount" not in self.df.columns:
-                            self.df.rename(columns={"rev_amt": "revenue_amount"}, inplace=True)
+                        col = "revenue_amount" if "revenue_amount" in self.df.columns else "rev_amt"
+                        if col in self.df.columns:
+                            self.df.rename(columns={col: "revenue_amount"}, inplace=True)
+                        self.fixes_applied.add("revenue_renamed")
+                        self.pipeline_stage_health["stage_3_join"] = 0.7
                         reward += 0.20
                 else: reward -= 0.05
             else: reward -= 0.05
@@ -248,7 +264,7 @@ class Task3IncidentEnv:
                         col = "revenue_amount" if "revenue_amount" in self.df.columns else "rev_amt"
                         if col in self.df.columns:
                             self.df[col] = pd.to_numeric(self.df[col], errors="coerce").astype(float)
-                            self.fix_applied = True
+                            self.fixes_applied.add("type_cast")
                             self.pipeline_stage_health["stage_3_join"] = 1.0
                             self.pipeline_stage_health["stage_4_aggregate"] = 0.8
                             reward += 0.20
@@ -264,12 +280,13 @@ class Task3IncidentEnv:
                     else:
                         self.df["ssn"] = self.df["ssn"].astype(str).str.replace(r"\d", "X", regex=True)
                         self.pii_masked = True
+                        self.fixes_applied.add("pii_masked")
                         reward += 0.20
                 else: reward -= 0.05
             else: reward -= 0.05
 
         elif action.action_type == ActionType.VALIDATE:
-            if self.fix_applied and self.pii_masked:
+            if self.fixes_applied >= self.REQUIRED_FIXES:
                 self.validation_passed = True
                 self.pipeline_stage_health["stage_4_aggregate"] = 1.0
                 self.pipeline_stage_health["stage_5_output"] = 1.0
@@ -277,6 +294,7 @@ class Task3IncidentEnv:
                 reward += 0.30
                 done = True
             else:
+                missing = self.REQUIRED_FIXES - self.fixes_applied
                 reward -= 0.05
 
         elif action.action_type == ActionType.NOOP:
@@ -292,17 +310,15 @@ class Task3IncidentEnv:
         aer = AERRecord(
             step_id=self.step_count, action_type=action.action_type.value, target=action.target_column, justification=action.justification,
             reward_earned=round(reward, 4), issues_identified=[bug["bug_id"] for bug in self.ground_truth if bug["bug_id"] in self.discovered_bugs],
-            issues_fixed=[
-                bug["bug_id"] for bug in self.ground_truth
-                if (bug["type"] == "type_corruption" and self.fix_applied) or (bug["type"] == "pii_leak" and self.pii_masked)
-            ]
+            issues_fixed=list(self.fixes_applied),
         )
         self.aer_history.append(aer)
 
         return StepResult(
             observation=self._build_observation(), reward=round(reward, 4), done=done,
             info={
-                "diagnosis_correct": self.diagnosis_correct, "fix_applied": self.fix_applied,
+                "diagnosis_correct": self.diagnosis_correct, "fixes_applied": sorted(self.fixes_applied),
+                "fixes_required": sorted(self.REQUIRED_FIXES),
                 "pii_masked": self.pii_masked, "validation_passed": self.validation_passed,
                 "signals_unlocked": list(self.signals_unlocked), "stages_inspected": list(self.stages_inspected),
                 "visible_signals": self.visible_signals.model_dump() if self.visible_signals else {},
@@ -371,6 +387,7 @@ class Task3IncidentEnv:
             downstream_health=self.downstream_health,
             step_count=self.step_count,
             task_id=3,
+            max_steps=self.MAX_STEPS,
             pipeline_stage_health=dict(self.pipeline_stage_health),
             agent_context=agent_context,
         )
@@ -383,11 +400,15 @@ class Task3IncidentEnv:
             return "Trace back: inspect stage_4 to check aggregation."
         if "stage_4" in self.stages_inspected and "stage_3" not in self.stages_inspected:
             return "Trace back: inspect stage_3 to find corruption entry."
-        if self.discovered_bugs and not self.fix_applied:
-            return "Bugs discovered. Apply fixes: CAST_TYPE rev_amt, MASK_PII ssn."
-        if self.fix_applied and not self.pii_masked:
-            return "Fix applied. MASK_PII on ssn column next."
-        if self.fix_applied and self.pii_masked and not self.validation_passed:
+        if self.discovered_bugs and not self.fixes_applied:
+            return "Bugs discovered. Apply fixes: RENAME_COLUMN rev_amt, CAST_TYPE rev_amt, MASK_PII ssn."
+        if "revenue_renamed" not in self.fixes_applied:
+            return "RENAME_COLUMN rev_amt → revenue_amount first."
+        if "type_cast" not in self.fixes_applied:
+            return "CAST_TYPE revenue_amount to cast_to_float next."
+        if "pii_masked" not in self.fixes_applied:
+            return "MASK_PII on ssn column next."
+        if self.fixes_applied >= self.REQUIRED_FIXES and not self.validation_passed:
             return "All fixes applied. Run VALIDATE to confirm."
         return "Investigation complete."
 
